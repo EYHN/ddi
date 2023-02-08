@@ -1,0 +1,12 @@
+[package]
+name = "ddi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["EYHN <cneyhn@gmail.com>"]
+description = " Dynamic dependency injection library for rust."
+repository = "https://github.com/EYHN/test-results"
+keywords = ["di", "ddi", "dependency-injection" ]
+readme = "README.md"
+
+[dependencies]
