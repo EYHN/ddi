@@ -1,6 +1,6 @@
-# Work in progress
-
 # DDI (dynamic dependency injection)
+
+[![](https://img.shields.io/crates/v/ddi)](https://crates.io/crates/ddi) ![](https://img.shields.io/crates/l/ddi)
 
 This library provides a generic dependency injection container that can be easily integrated into any application and can be extremely extensible with the [extension trait](https://rust-lang.github.io/rfcs/0445-extension-trait-conventions.html).
 
