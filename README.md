@@ -4,7 +4,7 @@
 
 This library provides a generic dependency injection container that can be easily integrated into any application and can be extremely extensible with the [extension trait](https://rust-lang.github.io/rfcs/0445-extension-trait-conventions.html).
 
-Dependency injection is a common design pattern , mainly used in some frameworks such as [Rocket](https://rocket.rs/), [Actix Web](https://actix.rs/), [bevy](https://bevyengine.org/). With `DDI` you can implement dependency injection without such frameworks, and you can implement your own framework.
+Dependency injection is a common design pattern , mainly used in some frameworks such as [Rocket](https://rocket.rs/), [Actix Web](https://actix.rs/), [bevy](https://bevyengine.org/). With `ddi` you can implement dependency injection without such frameworks, and you can implement your own framework.
 
 # Example
 
