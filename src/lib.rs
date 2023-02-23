@@ -271,11 +271,35 @@ impl_service_function!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
 impl_service_function!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
 impl_service_function!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
-pub type ServiceFactory =
-    Box<dyn FnOnce(&mut dyn ServiceResolver) -> DDIResult<Box<dyn Any + Send>> + 'static + Send>;
+enum ServiceFactory {
+    FnOnce(
+        Option<
+            Box<
+                dyn FnOnce(&dyn ServiceResolver) -> DDIResult<Box<dyn Any + Send>> + 'static + Send,
+            >,
+        >,
+    ),
+    FnMut(Box<dyn FnMut(&dyn ServiceResolver) -> DDIResult<Box<dyn Any + Send>> + 'static + Send>),
+    Fn(Box<dyn Fn(&dyn ServiceResolver) -> DDIResult<Box<dyn Any + Send>> + 'static + Send>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ServiceLifetime {
+    Singleton,
+    Transient,
+    Scoped(u8),
+}
+
+impl Default for ServiceLifetime {
+    fn default() -> Self {
+        Self::Singleton
+    }
+}
+
+struct ServiceFactoryDescriptor(ServiceLifetime, ServiceFactory);
 
 pub struct ServiceCollection {
-    pub map: HashMap<ServiceSymbol, Vec<(ServiceName, Option<ServiceFactory>)>>,
+    pub map: HashMap<ServiceSymbol, Vec<(ServiceName, ServiceFactoryDescriptor)>>,
 }
 
 impl ServiceCollection {
@@ -297,6 +321,26 @@ impl ServiceCollection {
     }
 }
 
+impl ServiceCollection {
+    fn service_raw(
+        &mut self,
+        symbol: ServiceSymbol,
+        name: ServiceName,
+        factoryDescriptor: ServiceFactoryDescriptor,
+    ) {
+        if let Some(service) = self.map.get_mut(&symbol) {
+            let exists = service.iter().position(|s| &s.0 == &name);
+            if let Some(exists) = exists {
+                service[exists] = (name, factoryDescriptor)
+            } else {
+                service.push((name, factoryDescriptor))
+            }
+        } else {
+            self.map.insert(symbol, vec![(name, factoryDescriptor)]);
+        }
+    }
+}
+
 impl Debug for ServiceCollection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut list = f.debug_list();
@@ -310,8 +354,6 @@ impl Debug for ServiceCollection {
 }
 
 pub trait ServiceCollectionExt: Sized {
-    fn service_raw(&mut self, symbol: ServiceSymbol, name: ServiceName, factory: ServiceFactory);
-
     fn service<T: 'static + Send>(&mut self, value: T);
 
     fn service_var<T: 'static + Send>(&mut self, name: impl Into<ServiceName>, value: T);
@@ -337,26 +379,20 @@ pub trait ServiceCollectionExt: Sized {
 }
 
 impl ServiceCollectionExt for ServiceCollection {
-    fn service_raw(&mut self, symbol: ServiceSymbol, name: ServiceName, factory: ServiceFactory) {
-        if let Some(service) = self.map.get_mut(&symbol) {
-            let exists = service.iter().position(|s| &s.0 == &name);
-            if let Some(exists) = exists {
-                service[exists] = (name, Some(factory))
-            } else {
-                service.push((name, Some(factory)))
-            }
-        } else {
-            self.map.insert(symbol, vec![(name, Some(factory))]);
-        }
-    }
-
     fn service<T: 'static + Send>(&mut self, value: T) {
         self.service_var("default", value)
     }
 
     fn service_var<T: 'static + Send>(&mut self, name: impl Into<ServiceName>, value: T) {
         let symbol = ServiceSymbol::new::<T>();
-        self.service_raw(symbol, name.into(), Box::new(move |_| Ok(Box::new(value))));
+        self.service_raw(
+            symbol,
+            name.into(),
+            ServiceFactoryDescriptor(
+                ServiceLifetime::Singleton,
+                ServiceFactory::FnOnce(Some(Box::new(move |_| Ok(Box::new(value))))),
+            ),
+        );
     }
 
     fn service_factory<
@@ -383,9 +419,12 @@ impl ServiceCollectionExt for ServiceCollection {
         self.service_raw(
             symbol,
             name.into(),
-            Box::new(move |service_resolver| {
-                Ok(Box::new(factory.run_with_once(service_resolver)??))
-            }),
+            ServiceFactoryDescriptor(
+                ServiceLifetime::Singleton,
+                ServiceFactory::FnOnce(Some(Box::new(move |service_resolver| {
+                    Ok(Box::new(factory.run_with_once(service_resolver)??))
+                }))),
+            ),
         )
     }
 }
