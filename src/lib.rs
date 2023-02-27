@@ -1,16 +1,59 @@
 #![doc = include_str!("../README.md")]
+#![cfg_attr(not(feature = "std"), no_std)]
 
-use std::{
-    any::{type_name, Any, TypeId},
-    cell::{RefCell, UnsafeCell},
-    collections::HashMap,
-    error,
+extern crate alloc;
+
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+use core::{
+    any::{type_name, TypeId},
     fmt::{self, Debug, Display},
     hash::Hash,
-    sync::Arc,
 };
 
-pub type Service<T> = Arc<T>;
+#[cfg(not(feature = "sync"))]
+use core::cell::{RefCell, UnsafeCell};
+
+#[cfg(feature = "std")]
+use std::error;
+
+#[cfg(feature = "sync")]
+use std::sync::{Mutex, RwLock, TryLockError};
+
+#[cfg(not(feature = "std"))]
+pub type Map<K, V> = alloc::collections::BTreeMap<K, V>;
+#[cfg(not(feature = "std"))]
+pub type MapEntry<'a, K, V> = alloc::collections::btree_map::Entry<'a, K, V>;
+
+#[cfg(feature = "std")]
+pub type Map<K, V> = std::collections::HashMap<K, V>;
+#[cfg(feature = "std")]
+pub type MapEntry<'a, K, V> = std::collections::hash_map::Entry<'a, K, V>;
+
+#[cfg(not(feature = "sync"))]
+mod cfg {
+    use core::any::Any;
+
+    pub type AnyService = dyn Any;
+    pub trait TypedServiceTrait: 'static {}
+    impl<T> TypedServiceTrait for T where T: 'static {}
+    pub type Rc<T> = alloc::rc::Rc<T>;
+    pub type Weak<T> = alloc::rc::Weak<T>;
+}
+
+#[cfg(feature = "sync")]
+mod cfg {
+    use core::any::Any;
+
+    pub type AnyService = dyn Any + Send + Sync;
+    pub trait TypedServiceTrait: 'static + Send + Sync {}
+    impl<T> TypedServiceTrait for T where T: 'static + Send + Sync {}
+    pub type Rc<T> = alloc::sync::Arc<T>;
+    pub type Weak<T> = alloc::sync::Weak<T>;
+}
+
+use cfg::*;
+
+pub type Service<T> = Rc<T>;
 
 #[derive(Clone, Copy)]
 pub enum ServiceSymbol {
@@ -32,7 +75,7 @@ impl Debug for ServiceSymbol {
 }
 
 impl Hash for ServiceSymbol {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         match self {
             Self::Type(type_id, _) => type_id.hash(state),
         }
@@ -49,10 +92,28 @@ impl PartialEq for ServiceSymbol {
 
 impl Eq for ServiceSymbol {}
 
-#[derive(Clone)]
+impl PartialOrd for ServiceSymbol {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        match (self, other) {
+            (Self::Type(type_id, _), Self::Type(type_id_other, _)) => {
+                type_id.partial_cmp(type_id_other)
+            }
+        }
+    }
+}
+
+impl Ord for ServiceSymbol {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        match (self, other) {
+            (Self::Type(type_id, _), Self::Type(type_id_other, _)) => type_id.cmp(type_id_other),
+        }
+    }
+}
+
+#[derive(Clone, PartialOrd, Ord)]
 pub enum ServiceName {
     Static(&'static str),
-    Dynamic(Arc<String>),
+    Dynamic(Rc<String>),
 }
 
 impl ServiceName {
@@ -65,7 +126,7 @@ impl ServiceName {
 }
 
 impl Hash for ServiceName {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         let name = match self {
             ServiceName::Static(s) => *s,
             ServiceName::Dynamic(s) => s,
@@ -77,13 +138,13 @@ impl Hash for ServiceName {
 
 impl Debug for ServiceName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        std::fmt::Debug::fmt(self.name(), f)
+        core::fmt::Debug::fmt(self.name(), f)
     }
 }
 
 impl Display for ServiceName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        std::fmt::Display::fmt(self.name(), f)
+        core::fmt::Display::fmt(self.name(), f)
     }
 }
 
@@ -103,23 +164,23 @@ impl From<&'static str> for ServiceName {
 
 impl From<String> for ServiceName {
     fn from(s: String) -> Self {
-        ServiceName::Dynamic(Arc::new(s))
+        ServiceName::Dynamic(Rc::new(s))
     }
 }
 
 pub trait ServiceFnOnce<Param, Out> {
-    fn run_once(self, dependencies: &[&dyn Any]) -> Out;
+    fn run_once(self, dependencies: &[&AnyService]) -> Out;
     fn dependencies() -> Vec<(ServiceSymbol, ServiceName)>;
     fn run_with_once(self, service_ref: &dyn ServiceResolver) -> DDIResult<Out>;
 }
 
 pub trait ServiceFnMut<Param, Out>: ServiceFnOnce<Param, Out> {
-    fn run_mut(&mut self, dependencies: &[&dyn Any]) -> Out;
+    fn run_mut(&mut self, dependencies: &[&AnyService]) -> Out;
     fn run_with_mut(&mut self, service_ref: &dyn ServiceResolver) -> DDIResult<Out>;
 }
 
 pub trait ServiceFn<Param, Out>: ServiceFnMut<Param, Out> {
-    fn run(&self, dependencies: &[&dyn Any]) -> Out;
+    fn run(&self, dependencies: &[&AnyService]) -> Out;
     fn run_with(&self, service_ref: &dyn ServiceResolver) -> DDIResult<Out>;
 }
 
@@ -131,12 +192,12 @@ macro_rules! impl_service_function {
         where
             Func: Fn($(&$param,)*) -> Out,
         {
-            fn run(&self, dependencies: &[&dyn Any]) -> Out {
+            fn run(&self, dependencies: &[&AnyService]) -> Out {
                 fn call_inner<Out, $($param,)*>(f: impl Fn($(&$param,)*) -> Out, $($param: &$param,)*) -> Out {
                     f($($param,)*)
                 }
                 if let [$($param,)*] = dependencies {
-                    $(let $param = $param.downcast_ref::<$param>().expect(&format!("Failed downcast to {}", std::any::type_name::<$param>()));)*
+                    $(let $param = $param.downcast_ref::<$param>().expect(&format!("Failed downcast to {}", core::any::type_name::<$param>()));)*
                     call_inner(self, $($param,)*)
                 } else {
                     unreachable!()
@@ -145,19 +206,9 @@ macro_rules! impl_service_function {
 
             fn run_with(&self, service: &dyn ServiceResolver) -> DDIResult<Out> {
                 let dependencies = Self::dependencies();
-                let service_ref = ServiceRef {
-                    // SAFETY: Here use `core::mem::transmute` to modify the life cycle of `&dyn ServiceResolver` to 'static, because `service_ref` is only lives in this function so it is safe.
-                    resolver: unsafe { core::mem::transmute(service as &dyn ServiceResolver) },
-                };
                 let mut deps = Vec::with_capacity(dependencies.len());
                 for (dep_symbol, dep_name) in dependencies.into_iter() {
-                    let value: &dyn Any = if dep_symbol == ServiceSymbol::new::<ServiceRef>() {
-                        &service_ref
-                    } else
-                    {
-                        service.resolve(dep_symbol.clone(), dep_name)?
-                    };
-
+                    let value = service.resolve(dep_symbol.clone(), dep_name)?;
                     deps.push(value);
                 }
 
@@ -171,12 +222,12 @@ macro_rules! impl_service_function {
         where
             Func: FnMut($(&$param,)*) -> Out,
         {
-            fn run_mut(&mut self, dependencies: &[&dyn Any]) -> Out {
+            fn run_mut(&mut self, dependencies: &[&AnyService]) -> Out {
                 fn call_inner<Out, $($param,)*>(mut f: impl FnMut($(&$param,)*) -> Out, $($param: &$param,)*) -> Out {
                     f($($param,)*)
                 }
                 if let [$($param,)*] = dependencies {
-                    $(let $param = $param.downcast_ref::<$param>().expect(&format!("Failed downcast to {}", std::any::type_name::<$param>()));)*
+                    $(let $param = $param.downcast_ref::<$param>().expect(&format!("Failed downcast to {}", core::any::type_name::<$param>()));)*
                     call_inner(self, $($param,)*)
                 } else {
                     unreachable!()
@@ -185,19 +236,9 @@ macro_rules! impl_service_function {
 
             fn run_with_mut(&mut self, service: &dyn ServiceResolver) -> DDIResult<Out> {
                 let dependencies = Self::dependencies();
-                let service_ref = ServiceRef {
-                    // SAFETY: Here use `core::mem::transmute` to modify the life cycle of `&dyn ServiceResolver` to 'static, because `service_ref` is only lives in this function so it is safe.
-                    resolver: unsafe { core::mem::transmute(service as &dyn ServiceResolver) },
-                };
                 let mut deps = Vec::with_capacity(dependencies.len());
                 for (dep_symbol, dep_name) in dependencies.into_iter() {
-                    let value: &dyn Any = if dep_symbol == ServiceSymbol::new::<ServiceRef>() {
-                        &service_ref
-                    } else
-                    {
-                        service.resolve(dep_symbol.clone(), dep_name)?
-                    };
-
+                    let value = service.resolve(dep_symbol.clone(), dep_name)?;
                     deps.push(value);
                 }
 
@@ -211,12 +252,12 @@ macro_rules! impl_service_function {
         where
             Func: FnOnce($(&$param,)*) -> Out,
         {
-            fn run_once(self, dependencies: &[&dyn Any]) -> Out {
+            fn run_once(self, dependencies: &[&AnyService]) -> Out {
                 fn call_inner<Out, $($param,)*>(f: impl FnOnce($(&$param,)*) -> Out, $($param: &$param,)*) -> Out {
                     f($($param,)*)
                 }
                 if let [$($param,)*] = dependencies {
-                    $(let $param = $param.downcast_ref::<$param>().expect(&format!("Failed downcast to {}", std::any::type_name::<$param>()));)*
+                    $(let $param = $param.downcast_ref::<$param>().expect(&format!("Failed downcast to {}", core::any::type_name::<$param>()));)*
                     call_inner(self, $($param,)*)
                 } else {
                     unreachable!()
@@ -231,19 +272,9 @@ macro_rules! impl_service_function {
 
             fn run_with_once(self, service: &dyn ServiceResolver) -> DDIResult<Out> {
                 let dependencies = Self::dependencies();
-                let service_ref = ServiceRef {
-                    // SAFETY: Here use `core::mem::transmute` to modify the life cycle of `&dyn ServiceResolver` to 'static, because `service_ref` is only lives in this function so it is safe.
-                    resolver: unsafe { core::mem::transmute(service as &dyn ServiceResolver) },
-                };
                 let mut deps = Vec::with_capacity(dependencies.len());
                 for (dep_symbol, dep_name) in dependencies.into_iter() {
-                    let value: &dyn Any = if dep_symbol == ServiceSymbol::new::<ServiceRef>() {
-                        &service_ref
-                    } else
-                    {
-                        service.resolve(dep_symbol, dep_name)?
-                    };
-
+                    let value = service.resolve(dep_symbol, dep_name)?;
                     deps.push(value);
                 }
 
@@ -271,18 +302,65 @@ impl_service_function!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
 impl_service_function!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
 impl_service_function!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
-pub type ServiceFactory =
-    Box<dyn FnOnce(&mut dyn ServiceResolver) -> DDIResult<Box<dyn Any + Send>> + 'static + Send>;
+#[cfg(not(feature = "sync"))]
+struct ServiceFactory(
+    RefCell<Option<Box<dyn FnOnce(&dyn ServiceResolver) -> DDIResult<Box<AnyService>> + 'static>>>,
+);
+
+#[cfg(not(feature = "sync"))]
+impl ServiceFactory {
+    fn new(f: impl FnOnce(&dyn ServiceResolver) -> DDIResult<Box<AnyService>> + 'static) -> Self {
+        Self(RefCell::new(Some(Box::new(f))))
+    }
+    fn take(
+        &self,
+    ) -> DDIResult<Box<dyn FnOnce(&dyn ServiceResolver) -> DDIResult<Box<AnyService>> + 'static>>
+    {
+        let lock = self.0.try_borrow_mut();
+        match lock {
+            Ok(mut factory) => Ok(factory.take().unwrap()),
+            Err(_) => Err(DDIError::Deadlock),
+        }
+    }
+}
+
+#[cfg(feature = "sync")]
+struct ServiceFactory(
+    Mutex<
+        Option<
+            Box<dyn FnOnce(&dyn ServiceResolver) -> DDIResult<Box<AnyService>> + 'static + Send>,
+        >,
+    >,
+);
+
+#[cfg(feature = "sync")]
+impl ServiceFactory {
+    fn new(
+        f: impl FnOnce(&dyn ServiceResolver) -> DDIResult<Box<AnyService>> + 'static + Send,
+    ) -> Self {
+        Self(Mutex::new(Some(Box::new(f))))
+    }
+    fn take(
+        &self,
+    ) -> DDIResult<
+        Box<dyn FnOnce(&dyn ServiceResolver) -> DDIResult<Box<AnyService>> + 'static + Send>,
+    > {
+        let lock = self.0.try_lock();
+        match lock {
+            Ok(mut factory) => Ok(factory.take().unwrap()),
+            Err(TryLockError::Poisoned(_)) => Err(DDIError::PoisonError),
+            Err(TryLockError::WouldBlock) => Err(DDIError::Deadlock),
+        }
+    }
+}
 
 pub struct ServiceCollection {
-    pub map: HashMap<ServiceSymbol, Vec<(ServiceName, Option<ServiceFactory>)>>,
+    map: Map<ServiceSymbol, Vec<(ServiceName, ServiceFactory)>>,
 }
 
 impl ServiceCollection {
     pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
+        Self { map: Map::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -290,9 +368,19 @@ impl ServiceCollection {
     }
 
     pub fn provider(self) -> ServiceProvider {
-        ServiceProvider {
-            collection: RefCell::new(self),
-            cache: ServiceProviderCachePool::new(),
+        ServiceProvider::new(self, ServiceProviderCachePool::new())
+    }
+
+    fn service_raw(&mut self, symbol: ServiceSymbol, name: ServiceName, factory: ServiceFactory) {
+        if let Some(service) = self.map.get_mut(&symbol) {
+            let exists = service.iter().position(|s| &s.0 == &name);
+            if let Some(exists) = exists {
+                service[exists] = (name, factory)
+            } else {
+                service.push((name, factory))
+            }
+        } else {
+            self.map.insert(symbol, vec![(name, factory)]);
         }
     }
 }
@@ -310,16 +398,14 @@ impl Debug for ServiceCollection {
 }
 
 pub trait ServiceCollectionExt: Sized {
-    fn service_raw(&mut self, symbol: ServiceSymbol, name: ServiceName, factory: ServiceFactory);
+    fn service<T: TypedServiceTrait>(&mut self, value: T);
 
-    fn service<T: 'static + Send>(&mut self, value: T);
-
-    fn service_var<T: 'static + Send>(&mut self, name: impl Into<ServiceName>, value: T);
+    fn service_var<T: TypedServiceTrait>(&mut self, name: impl Into<ServiceName>, value: T);
 
     fn service_factory<
         Param,
-        T: 'static + Send,
-        Factory: ServiceFnOnce<Param, DDIResult<T>> + 'static + Send + Sync,
+        T: TypedServiceTrait,
+        Factory: ServiceFnOnce<Param, DDIResult<T>> + TypedServiceTrait,
     >(
         &mut self,
         factory: Factory,
@@ -327,8 +413,8 @@ pub trait ServiceCollectionExt: Sized {
 
     fn service_factory_var<
         Param,
-        T: 'static + Send,
-        Factory: ServiceFnOnce<Param, DDIResult<T>> + 'static + Send + Sync,
+        T: TypedServiceTrait,
+        Factory: ServiceFnOnce<Param, DDIResult<T>> + TypedServiceTrait,
     >(
         &mut self,
         name: impl Into<ServiceName>,
@@ -337,32 +423,23 @@ pub trait ServiceCollectionExt: Sized {
 }
 
 impl ServiceCollectionExt for ServiceCollection {
-    fn service_raw(&mut self, symbol: ServiceSymbol, name: ServiceName, factory: ServiceFactory) {
-        if let Some(service) = self.map.get_mut(&symbol) {
-            let exists = service.iter().position(|s| &s.0 == &name);
-            if let Some(exists) = exists {
-                service[exists] = (name, Some(factory))
-            } else {
-                service.push((name, Some(factory)))
-            }
-        } else {
-            self.map.insert(symbol, vec![(name, Some(factory))]);
-        }
-    }
-
-    fn service<T: 'static + Send>(&mut self, value: T) {
+    fn service<T: TypedServiceTrait>(&mut self, value: T) {
         self.service_var("default", value)
     }
 
-    fn service_var<T: 'static + Send>(&mut self, name: impl Into<ServiceName>, value: T) {
+    fn service_var<T: TypedServiceTrait>(&mut self, name: impl Into<ServiceName>, value: T) {
         let symbol = ServiceSymbol::new::<T>();
-        self.service_raw(symbol, name.into(), Box::new(move |_| Ok(Box::new(value))));
+        self.service_raw(
+            symbol,
+            name.into(),
+            ServiceFactory::new(move |_| Ok(Box::new(value))),
+        );
     }
 
     fn service_factory<
         Param,
-        T: 'static + Send,
-        Factory: ServiceFnOnce<Param, DDIResult<T>> + 'static + Send + Sync,
+        T: TypedServiceTrait,
+        Factory: ServiceFnOnce<Param, DDIResult<T>> + TypedServiceTrait,
     >(
         &mut self,
         factory: Factory,
@@ -372,8 +449,8 @@ impl ServiceCollectionExt for ServiceCollection {
 
     fn service_factory_var<
         Param,
-        T: 'static + Send,
-        Factory: ServiceFnOnce<Param, DDIResult<T>> + 'static + Send + Sync,
+        T: TypedServiceTrait,
+        Factory: ServiceFnOnce<Param, DDIResult<T>> + TypedServiceTrait,
     >(
         &mut self,
         name: impl Into<ServiceName>,
@@ -383,26 +460,82 @@ impl ServiceCollectionExt for ServiceCollection {
         self.service_raw(
             symbol,
             name.into(),
-            Box::new(move |service_resolver| {
+            ServiceFactory::new(move |service_resolver| {
                 Ok(Box::new(factory.run_with_once(service_resolver)??))
             }),
         )
     }
 }
 
-struct ServiceProviderCachePool {
-    // SAFETY: UnsafeCell is designed to be able to write new data while holding read references to the existing data in the hashmap. We only need to ensure that writing to the hashmap does not affect the existing data, i.e., we can safely hold read references to the data in the hashmap.
-    cache: UnsafeCell<HashMap<(ServiceSymbol, ServiceName), ServiceProviderCacheItem>>,
+#[cfg(not(feature = "sync"))]
+struct InsertOnlyMap<K, V> {
+    map: UnsafeCell<Map<K, Box<V>>>,
 }
 
-struct ServiceProviderCacheItem {
-    owned: Box<dyn Any + Send>,
-}
-
-impl ServiceProviderCacheItem {
-    fn as_any_ref(&self) -> &(dyn Any + Send) {
-        self.owned.as_ref()
+#[cfg(not(feature = "sync"))]
+impl<K, V> Default for InsertOnlyMap<K, V> {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+        }
     }
+}
+
+#[cfg(not(feature = "sync"))]
+impl<K: Clone + Ord + Hash, V> InsertOnlyMap<K, V> {
+    fn insert_with(&self, k: K, f: impl FnOnce() -> DDIResult<V>) -> DDIResult<&V> {
+        Ok(unsafe {
+            let map = self.map.get();
+            match (*map).entry(k) {
+                MapEntry::Occupied(entry) => {
+                    &*((&**entry.get()) as *const _)
+                }
+                MapEntry::Vacant(entry) => {
+                    &*((&**entry.insert(Box::new(f()?))) as *const _)
+                }
+            }
+        })
+    }
+}
+
+#[cfg(feature = "sync")]
+struct InsertOnlyMap<K, V> {
+    map: RwLock<Map<K, Box<V>>>,
+}
+
+#[cfg(feature = "sync")]
+impl<K, V> Default for InsertOnlyMap<K, V> {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+        }
+    }
+}
+
+#[cfg(feature = "sync")]
+impl<K: Eq + Hash, V> InsertOnlyMap<K, V> {
+    fn insert_with(&self, k: K, f: impl FnOnce() -> DDIResult<V>) -> DDIResult<&V> {
+        match self.map.write() {
+            Ok(mut map) => {
+                let ret = unsafe {
+                    match map.entry(k) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            &*((&**entry.get()) as *const _)
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            &*((&**entry.insert(Box::new(f()?))) as *const _)
+                        }
+                    }
+                };
+                Ok(ret)
+            }
+            Err(_) => Err(DDIError::PoisonError),
+        }
+    }
+}
+
+struct ServiceProviderCachePool {
+    cache: InsertOnlyMap<ServiceSymbol, InsertOnlyMap<ServiceName, Box<AnyService>>>,
 }
 
 impl ServiceProviderCachePool {
@@ -412,58 +545,30 @@ impl ServiceProviderCachePool {
         }
     }
 
-    fn get_cache_ref(
+    fn get_or_insert(
         &self,
         symbol: ServiceSymbol,
         var_name: ServiceName,
-    ) -> Option<&(dyn Any + Send)> {
-        // SAFETY: See the comments for the cache field
-        unsafe { &*self.cache.get() }
-            .get(&(symbol, var_name))
-            .map(|c| c.as_any_ref())
-    }
-
-    fn cache_insert_owned(
-        &self,
-        symbol: ServiceSymbol,
-        var_name: ServiceName,
-        value: Box<dyn Any + Send>,
-    ) -> &(dyn Any + Send) {
-        // SAFETY: See the comments for the cache field
-        let cache = unsafe { &mut *self.cache.get() };
-
-        match cache.entry((symbol.clone(), var_name.clone())) {
-            std::collections::hash_map::Entry::Occupied(_) => panic!("cache state error!"),
-            std::collections::hash_map::Entry::Vacant(entry) => entry
-                .insert(ServiceProviderCacheItem { owned: value })
-                .as_any_ref(),
-        }
+        insert: impl FnOnce() -> DDIResult<Box<AnyService>>,
+    ) -> DDIResult<&AnyService> {
+        let part = self.cache.insert_with(symbol, || Ok(Default::default()))?;
+        let service = part.insert_with(var_name, move || insert())?;
+        Ok(service.as_ref())
     }
 }
 
 pub trait ServiceResolver {
-    fn resolve(&self, symbol: ServiceSymbol, var_name: ServiceName)
-        -> DDIResult<&(dyn Any + Send)>;
+    fn resolve(&self, symbol: ServiceSymbol, var_name: ServiceName) -> DDIResult<&AnyService>;
 
-    fn resolve_all(
-        &self,
-        symbol: ServiceSymbol,
-    ) -> DDIResult<Vec<(ServiceName, &(dyn Any + Send))>>;
+    fn resolve_all(&self, symbol: ServiceSymbol) -> DDIResult<Vec<(ServiceName, &AnyService)>>;
 }
 
 impl<T: ServiceResolver + ?Sized> ServiceResolver for &T {
-    fn resolve(
-        &self,
-        symbol: ServiceSymbol,
-        var_name: ServiceName,
-    ) -> DDIResult<&(dyn Any + Send)> {
+    fn resolve(&self, symbol: ServiceSymbol, var_name: ServiceName) -> DDIResult<&AnyService> {
         (*self).resolve(symbol, var_name)
     }
 
-    fn resolve_all(
-        &self,
-        symbol: ServiceSymbol,
-    ) -> DDIResult<Vec<(ServiceName, &(dyn Any + Send))>> {
+    fn resolve_all(&self, symbol: ServiceSymbol) -> DDIResult<Vec<(ServiceName, &AnyService)>> {
         (*self).resolve_all(symbol)
     }
 }
@@ -525,27 +630,20 @@ impl<'r> TrackServiceResolver<'r> {
         &self,
         symbol: ServiceSymbol,
         var_name: ServiceName,
-    ) -> DDIResult<&'r (dyn Any + Send)> {
-        if let Some(value) = self.provider.cache.get_cache_ref(symbol, var_name.clone()) {
-            return Ok(value);
-        }
+    ) -> DDIResult<&'r AnyService> {
+        let cache = &self.provider.shared.cache;
+        let next_resolver = self.track(&symbol, &var_name)?;
+        cache.get_or_insert(symbol, var_name.clone(), move || {
+            let collection = &self.provider.shared.collection;
+            let vars = collection.map.get(&symbol);
+            let factory = vars
+                .and_then(|vars| vars.iter().find(|s| &s.0 == &var_name).map(|s| &s.1))
+                .ok_or_else(|| DDIError::ServiceNotFound((symbol, var_name.clone())))?;
 
-        let mut collection = self.provider.collection.borrow_mut();
-        let vars = collection.map.get_mut(&symbol);
-        let factory = vars
-            .and_then(|vars| {
-                vars.iter_mut()
-                    .find(|s| &s.0 == &var_name)
-                    .map(|s| &mut s.1)
-            })
-            .ok_or_else(|| DDIError::ServiceNotFound((symbol, var_name.clone())))?;
+            let factory = factory.take()?;
+            core::mem::drop(collection);
 
-        let factory = factory.take();
-        core::mem::drop(collection);
-        let mut next_resolver = self.track(&symbol, &var_name)?;
-
-        let value = {
-            let service = factory.unwrap()(&mut next_resolver).map_err(|e| {
+            let service = factory(&next_resolver).map_err(|e| {
                 if let DDIError::ServiceNotFound((not_found_symbol, not_found_name)) = e {
                     DDIError::MissingDependency(
                         (symbol, var_name.clone()),
@@ -556,58 +654,41 @@ impl<'r> TrackServiceResolver<'r> {
                 }
             })?;
 
-            self.provider
-                .cache
-                .cache_insert_owned(symbol, var_name, service)
-        };
-        Ok(value)
+            Ok(service)
+        })
     }
 
     fn resolve_all_inner(
         &self,
         symbol: ServiceSymbol,
-    ) -> DDIResult<Vec<(ServiceName, &'r (dyn Any + Send))>> {
-        let mut collection = self.provider.collection.borrow_mut();
-        let vars = collection.map.get_mut(&symbol).map(|v| &mut v[..]);
+    ) -> DDIResult<Vec<(ServiceName, &'r AnyService)>> {
+        let collection = &self.provider.shared.collection;
+        let vars = collection.map.get(&symbol).map(|v| &v[..]);
 
         if let Some(vars) = vars {
+            let cache = &self.provider.shared.cache;
             let mut result = Vec::with_capacity(vars.len());
-            let mut factories = Vec::with_capacity(vars.len());
 
-            for (var_name, factory) in vars.iter_mut() {
-                if let Some(value) = self
-                    .provider
-                    .cache
-                    .get_cache_ref(symbol.clone(), var_name.clone())
-                {
-                    result.push((var_name.clone(), value));
-                } else {
-                    factories.push((var_name.clone(), factory.take()));
-                }
-            }
+            for (var_name, factory) in vars.iter() {
+                let next_resolver = self.track(&symbol, &var_name)?;
+                let service = cache.get_or_insert(symbol, var_name.clone(), move || {
+                    let factory = factory.take()?;
+                    let service = factory(&next_resolver).map_err(|e| {
+                        if let DDIError::ServiceNotFound((not_found_symbol, not_found_name)) = e {
+                            DDIError::MissingDependency(
+                                (symbol, var_name.clone()),
+                                (not_found_symbol, not_found_name),
+                            )
+                        } else {
+                            e
+                        }
+                    })?;
 
-            core::mem::drop(collection);
-
-            for (var_name, factory) in factories {
-                let mut next_resolver = self.track(&symbol, &var_name)?;
-                let service = factory.unwrap()(&mut next_resolver).map_err(|e| {
-                    if let DDIError::ServiceNotFound((not_found_symbol, not_found_name)) = e {
-                        DDIError::MissingDependency(
-                            (symbol.clone(), var_name.clone()),
-                            (not_found_symbol, not_found_name),
-                        )
-                    } else {
-                        e
-                    }
+                    Ok(service)
                 })?;
-
-                let value = self.provider.cache.cache_insert_owned(
-                    symbol.clone(),
-                    var_name.clone(),
-                    service,
-                );
-                result.push((var_name, value));
+                result.push((var_name.clone(), service))
             }
+
             Ok(result)
         } else {
             Ok(Vec::new())
@@ -626,11 +707,7 @@ impl<'r> TrackServiceResolver<'r> {
 
         #[cfg(debug_assertions)]
         let track = {
-            let circular = self
-                .track
-                .iter()
-                .find(|(s, v)| s == symbol && v == var_name)
-                .is_some();
+            let circular = self.track.iter().find(|(s, _)| s == symbol).is_some();
             let mut track = self.track.clone();
             track.push((symbol.clone(), var_name.clone()));
             if circular {
@@ -649,67 +726,56 @@ impl<'r> TrackServiceResolver<'r> {
 }
 
 impl<'r> ServiceResolver for TrackServiceResolver<'r> {
-    fn resolve(
-        &self,
-        symbol: ServiceSymbol,
-        var_name: ServiceName,
-    ) -> DDIResult<&(dyn Any + Send)> {
+    fn resolve(&self, symbol: ServiceSymbol, var_name: ServiceName) -> DDIResult<&AnyService> {
         self.resolve_inner(symbol, var_name)
     }
 
-    fn resolve_all(
-        &self,
-        symbol: ServiceSymbol,
-    ) -> DDIResult<Vec<(ServiceName, &(dyn Any + Send))>> {
+    fn resolve_all(&self, symbol: ServiceSymbol) -> DDIResult<Vec<(ServiceName, &AnyService)>> {
         self.resolve_all_inner(symbol)
     }
 }
 
-pub struct ServiceRef {
-    resolver: &'static dyn ServiceResolver,
-}
-
-impl ServiceRef {
-    pub fn resolver(&self) -> &dyn ServiceResolver {
-        self.resolver
-    }
-}
-
-impl ServiceResolver for ServiceRef {
-    fn resolve(
-        &self,
-        symbol: ServiceSymbol,
-        var_name: ServiceName,
-    ) -> DDIResult<&(dyn Any + Send)> {
-        self.resolver.resolve(symbol, var_name)
-    }
-
-    fn resolve_all(
-        &self,
-        symbol: ServiceSymbol,
-    ) -> DDIResult<Vec<(ServiceName, &(dyn Any + Send))>> {
-        self.resolver.resolve_all(symbol)
-    }
-}
-
-pub struct ServiceProvider {
-    collection: RefCell<ServiceCollection>,
+struct ServiceProviderInner {
+    collection: ServiceCollection,
     cache: ServiceProviderCachePool,
 }
 
+impl ServiceProviderInner {
+    fn new(collection: ServiceCollection, cache: ServiceProviderCachePool) -> Self {
+        Self { collection, cache }
+    }
+}
+
+#[derive(Clone)]
+pub struct ServiceProvider {
+    shared: Rc<ServiceProviderInner>,
+}
+
+impl ServiceProvider {
+    fn new(collection: ServiceCollection, cache: ServiceProviderCachePool) -> Self {
+        let shared = Rc::new(ServiceProviderInner::new(collection, cache));
+        let weak = Rc::downgrade(&shared);
+        unsafe {
+            (shared.as_ref() as *const _ as *mut ServiceProviderInner)
+                .as_mut()
+                .unwrap()
+        }
+        .collection
+        .service_factory(move || {
+            Ok(ServiceProvider {
+                shared: Weak::upgrade(&weak).unwrap(),
+            })
+        });
+        ServiceProvider { shared }
+    }
+}
+
 impl ServiceResolver for ServiceProvider {
-    fn resolve(
-        &self,
-        symbol: ServiceSymbol,
-        var_name: ServiceName,
-    ) -> DDIResult<&(dyn Any + Send)> {
+    fn resolve(&self, symbol: ServiceSymbol, var_name: ServiceName) -> DDIResult<&AnyService> {
         TrackServiceResolver::new(self).resolve_inner(symbol, var_name)
     }
 
-    fn resolve_all(
-        &self,
-        symbol: ServiceSymbol,
-    ) -> DDIResult<Vec<(ServiceName, &(dyn Any + Send))>> {
+    fn resolve_all(&self, symbol: ServiceSymbol) -> DDIResult<Vec<(ServiceName, &AnyService)>> {
         TrackServiceResolver::new(self).resolve_all_inner(symbol)
     }
 }
@@ -720,11 +786,7 @@ pub struct ChildServiceProvider<'p> {
 }
 
 impl ServiceResolver for ChildServiceProvider<'_> {
-    fn resolve(
-        &self,
-        symbol: ServiceSymbol,
-        var_name: ServiceName,
-    ) -> DDIResult<&(dyn Any + Send)> {
+    fn resolve(&self, symbol: ServiceSymbol, var_name: ServiceName) -> DDIResult<&AnyService> {
         match self.this.resolve(symbol, var_name.clone()) {
             Ok(service) => Ok(service),
             Err(DDIError::ServiceNotFound(_)) => self.parent.resolve(symbol, var_name),
@@ -732,10 +794,7 @@ impl ServiceResolver for ChildServiceProvider<'_> {
         }
     }
 
-    fn resolve_all(
-        &self,
-        symbol: ServiceSymbol,
-    ) -> DDIResult<Vec<(ServiceName, &(dyn Any + Send))>> {
+    fn resolve_all(&self, symbol: ServiceSymbol) -> DDIResult<Vec<(ServiceName, &AnyService)>> {
         match self.this.resolve_all(symbol.clone()) {
             Ok(services) => match self.parent.resolve_all(symbol) {
                 Ok(parent_services) => {
@@ -759,6 +818,8 @@ pub enum DDIError {
     CircularDependencyDetected(Vec<(ServiceSymbol, ServiceName)>),
     MissingDependency((ServiceSymbol, ServiceName), (ServiceSymbol, ServiceName)),
     ServiceNotFound((ServiceSymbol, ServiceName)),
+    Deadlock,
+    PoisonError,
 }
 
 impl Debug for DDIError {
@@ -799,6 +860,12 @@ impl Debug for DDIError {
                     service_symbol_debug_name(symbol, symbol_var_name)
                 )
             }
+            DDIError::Deadlock => {
+                write!(fmt, "Deadlock.",)
+            }
+            DDIError::PoisonError => {
+                write!(fmt, "Poison.",)
+            }
         }
     }
 }
@@ -809,13 +876,14 @@ impl Display for DDIError {
     }
 }
 
+#[cfg(feature = "std")]
 impl error::Error for DDIError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         None
     }
 }
 
-pub type DDIResult<T> = std::result::Result<T, DDIError>;
+pub type DDIResult<T> = core::result::Result<T, DDIError>;
 
 fn service_symbol_debug_name(symbol: &ServiceSymbol, var_name: &ServiceName) -> String {
     if var_name.name() == "default" {
@@ -827,8 +895,12 @@ fn service_symbol_debug_name(symbol: &ServiceSymbol, var_name: &ServiceName) -> 
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        DDIError, ServiceCollectionExt, ServiceFn, ServiceProvider, ServiceResolverExt,
+        ServiceSymbol,
+    };
 
-    use crate::{DDIError, ServiceCollectionExt, ServiceFn, ServiceResolverExt, ServiceSymbol};
+    use alloc::{format, string::String};
 
     use super::ServiceCollection;
 
@@ -914,7 +986,7 @@ mod tests {
             (|num: &usize, str: &&str| format!("{}{}", num, str))
                 .run_with(&mut services.provider())
                 .unwrap(),
-            "1helloworld".to_owned()
+            "1helloworld"
         )
     }
 
@@ -929,5 +1001,28 @@ mod tests {
 
         let wrapped = provider.wrap(child_services.provider());
         assert_eq!(&2usize, wrapped.get::<usize>().unwrap());
+    }
+
+    struct ServiceOwnedProvider(ServiceProvider);
+
+    impl ServiceOwnedProvider {
+        fn get_string(&self) -> &str {
+            *self.0.get::<&str>().unwrap()
+        }
+    }
+
+    #[test]
+    fn service_owned_provider() {
+        let mut services = ServiceCollection::new();
+        services.service("helloworld");
+        services.service_factory(move |provider: &ServiceProvider| {
+            Ok(ServiceOwnedProvider(provider.clone()))
+        });
+
+        let provider = services.provider();
+        assert_eq!(
+            provider.get::<ServiceOwnedProvider>().unwrap().get_string(),
+            "helloworld"
+        );
     }
 }

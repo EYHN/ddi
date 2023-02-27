@@ -22,6 +22,16 @@ let provider = services.provider();
 assert_eq!(provider.get::<TestService>().unwrap().0, "1helloworld");
 ```
 
+# `std` feature
+
+`ddi` supports `no-std` by default, if `std` feature enabled the internal data structure will be changed from [`alloc::collections::BTreeMap`] to [`std::collections::HashMap`] and [`std::error::Error`] will be implemented for [`DDIError`]. This will give a little performance improvement and usability.
+
+# `sync` feature
+
+If `sync` feature enabled, `ddi` will support multi-threading and you can share [`ServiceProvider`] between multiple threads.
+
+>! Enabling `sync` may cause your existing code to not compile! This is because enabling `sync` requires instances in the [`ServiceCollection`] to implement `send + sync` and `ServiceFactory` to implement `send`. And default no such restrictions.
+
 # Basic Usage
 
 First you need to register all services in the [`ServiceCollection`], which is a container of all services, [`ServiceCollection`] stored a series of triplets (type, name, implementation). You can use the [`ServiceCollection::service`] to add item to it.
@@ -115,9 +125,9 @@ let provider = services.provider();
 assert!(provider.get::<Service<DbService>>().is_ok());
 ```
 
-#### \* Use [`ServiceRef`] in the factory, get other services dynamically
+#### \* Use [`ServiceProvider`] in the factory, get other services dynamically
 
-In our previous examples service factory used static parameters to get the dependencies, in the following example we use [`ServiceRef`] to get the dependencies dynamically.
+In our previous examples service factory used static parameters to get the dependencies, in the following example we use [`ServiceProvider`] to get the dependencies dynamically.
 
 ```rust
 use ddi::*;
@@ -140,11 +150,11 @@ if SUPPORT_HARDWARE_DECODER {
 }
 services.service(Service::new(SoftwareDecoder));
 services.service_factory(
-  |service_ref: &ServiceRef| {
-    if let Ok(hardware) = service_ref.get::<Service<HardwareDecoder>>() {
+  |provider: &ServiceProvider| {
+    if let Ok(hardware) = provider.get::<Service<HardwareDecoder>>() {
       Ok(Playback { decoder: hardware.clone() })
     } else {
-      Ok(Playback { decoder: service_ref.get::<Service<SoftwareDecoder>>()?.clone() })
+      Ok(Playback { decoder: provider.get::<Service<SoftwareDecoder>>()?.clone() })
     }
   }
 );
@@ -159,10 +169,12 @@ The [`ServiceCollection`] can register multiple variants of the same type of ser
 
 The following example demonstrates how to build an http server based on service variants.
 
+#[doc(cfg(not(feature = "sync")))]
+
 ```rust
 use ddi::*;
 
-type Route = Service<dyn Fn() -> String + Send + Sync>;
+type Route = Service<dyn Fn() -> String>;
 struct HttpService {
   routes: std::collections::HashMap<String, Route>
 }
@@ -182,8 +194,8 @@ services.service_factory_var(
   }
 );
 services.service_factory(
-  |service_ref: &ServiceRef| {
-    let routes = service_ref.get_all::<Route>()?
+  |provider: &ServiceProvider| {
+    let routes = provider.get_all::<Route>()?
       .into_iter()
       .map(|(path, route)| (path.to_string(), route.clone()))
       .collect();
@@ -209,7 +221,7 @@ use ddi::*;
 
 // ------------ definition ------------
 
-type Route = Service<dyn Fn() -> String + Send + Sync>;
+type Route = Service<dyn Fn() -> String>;
 struct HttpService {
   routes: std::collections::HashMap<String, Route>
 }
@@ -220,8 +232,8 @@ struct BusinessService {
 pub trait HttpCollectionExt: ServiceCollectionExt {
     fn install_http(&mut self) {
       self.service_factory(
-        |service_ref: &ServiceRef| {
-          let routes = service_ref.get_all::<Route>()?
+        |provider: &ServiceProvider| {
+          let routes = provider.get_all::<Route>()?
             .into_iter()
             .map(|(path, route)| (path.to_string(), route.clone()))
             .collect();
@@ -230,15 +242,15 @@ pub trait HttpCollectionExt: ServiceCollectionExt {
       );
     }
 
-    fn install_route(&mut self, path: &'static str, route: impl Fn() -> String + Send + Sync + 'static) {
+    fn install_route(&mut self, path: &'static str, route: impl Fn() -> String + 'static) {
       self.service_var(path, Service::new(route) as Route);
     }
 
-    fn install_route_factory<Factory, Param, RouteImpl: Fn() -> String + Send + Sync + 'static>(&mut self, path: &'static str, route_factory: Factory)
+    fn install_route_factory<Factory, Param, RouteImpl: Fn() -> String + 'static>(&mut self, path: &'static str, route_factory: Factory)
     where
-      Factory: ServiceFnOnce<Param, DDIResult<RouteImpl>> + 'static + Send + Sync {
-      self.service_factory_var(path, move |service_ref: &ServiceRef| {
-        Ok(Service::new(route_factory.run_with_once(service_ref)??) as Route)
+      Factory: ServiceFnOnce<Param, DDIResult<RouteImpl>> + 'static {
+      self.service_factory_var(path, move |provider: &ServiceProvider| {
+        Ok(Service::new(route_factory.run_with_once(provider)??) as Route)
       })
     }
 }

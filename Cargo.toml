@@ -9,4 +9,6 @@ repository = "https://github.com/EYHN/ddi"
 keywords = ["di", "ddi", "dependency-injection" ]
 readme = "README.md"
 
-[dependencies]
+[features]
+std = []
+sync = ["std"]
