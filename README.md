@@ -6,7 +6,7 @@ This library provides a generic dependency injection container that can be easil
 
 Dependency injection is a common design pattern , mainly used in some frameworks such as [Rocket](https://rocket.rs/), [Actix Web](https://actix.rs/), [bevy](https://bevyengine.org/). With `ddi` you can implement dependency injection without such frameworks, and you can implement your own framework.
 
-# Example
+## Example
 
 ```rust
 use ddi::*;
@@ -22,17 +22,17 @@ let provider = services.provider();
 assert_eq!(provider.get::<TestService>().unwrap().0, "1helloworld");
 ```
 
-# `std` feature
+## `std` feature
 
 `ddi` supports `no-std` by default, if `std` feature enabled the internal data structure will be changed from [`alloc::collections::BTreeMap`] to [`std::collections::HashMap`] and [`std::error::Error`] will be implemented for [`DDIError`]. This will give a little performance improvement and usability.
 
-# `sync` feature
+## `sync` feature
 
 If `sync` feature enabled, `ddi` will support multi-threading and you can share [`ServiceProvider`] between multiple threads.
 
 >! Enabling `sync` may cause your existing code to not compile! This is because enabling `sync` requires instances in the [`ServiceCollection`] to implement `send + sync` and `ServiceFactory` to implement `send`. And default no such restrictions.
 
-# Basic Usage
+## Basic Usage
 
 First you need to register all services in the [`ServiceCollection`], which is a container of all services, [`ServiceCollection`] stored a series of triplets (type, name, implementation). You can use the [`ServiceCollection::service`] to add item to it.
 
@@ -62,7 +62,7 @@ let provider = services.provider();
 assert_eq!(provider.get::<TestService>().unwrap().0, "helloworld");
 ```
 
-# Design Patterns
+## Design Patterns
 
 #### \* Wrap your service with [`Service<T>`] (Arc)
 
