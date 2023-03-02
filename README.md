@@ -242,15 +242,10 @@ pub trait HttpCollectionExt: ServiceCollectionExt {
       );
     }
 
-    fn install_route(&mut self, path: &'static str, route: impl Fn() -> String + 'static) {
-      self.service_var(path, Service::new(route) as Route);
-    }
-
-    fn install_route_factory<Factory, Param, RouteImpl: Fn() -> String + 'static>(&mut self, path: &'static str, route_factory: Factory)
-    where
-      Factory: ServiceFnOnce<Param, DDIResult<RouteImpl>> + 'static {
+    fn install_route<Param>(&mut self, path: &'static str, route: impl ServiceFn<Param, String> + 'static) {
       self.service_factory_var(path, move |provider: &ServiceProvider| {
-        Ok(Service::new(route_factory.run_with_once(provider)??) as Route)
+        let owned_provider = provider.clone();
+        Ok(Service::new(move || route.run_with(&owned_provider).expect("123")) as Route)
       })
     }
 }
@@ -263,21 +258,20 @@ let mut services = ServiceCollection::new();
 
 services.install_route("/index", || "<html>".to_string());
 services.install_route("/404", || "404".to_string());
-services.install_route_factory("/business", |business: &Service<BusinessService>| {
-  let owned_business = business.clone();
-  Ok(move || owned_business.value.clone())
-});
+services.install_route("/business", |business: &BusinessService| business.value.to_string());
 services.install_http();
 
-services.service(Service::new(BusinessService {
+services.service(BusinessService {
   value: "hello".to_string()
-}));
+});
 
 let provider = services.provider();
 assert_eq!(provider.get::<HttpService>().unwrap().routes.get("/index").unwrap()(), "<html>");
 assert_eq!(provider.get::<HttpService>().unwrap().routes.get("/404").unwrap()(), "404");
 assert_eq!(provider.get::<HttpService>().unwrap().routes.get("/business").unwrap()(), "hello");
 ```
+
+The `install_route` function in the example uses the [`ServiceFn`] trait as argument, which is a powerful type, using the [`ServiceFn::run_with`] function to automatically extract Fn arguments from the [`ServiceProvider`] and execute it.
 
 # License
 
