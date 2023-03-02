@@ -6,6 +6,8 @@ This library provides a generic dependency injection container that can be easil
 
 Dependency injection is a common design pattern , mainly used in some frameworks such as [Rocket](https://rocket.rs/), [Actix Web](https://actix.rs/), [bevy](https://bevyengine.org/). With `ddi` you can implement dependency injection without such frameworks, and you can implement your own framework.
 
+> scope feature (singleton vs transient vs scoped/request) is on the way!
+
 ## Example
 
 ```rust
@@ -271,7 +273,7 @@ assert_eq!(provider.get::<HttpService>().unwrap().routes.get("/404").unwrap()(),
 assert_eq!(provider.get::<HttpService>().unwrap().routes.get("/business").unwrap()(), "hello");
 ```
 
-The `install_route` function in the example uses the [`ServiceFn`] trait as argument, which is a powerful type, using the [`ServiceFn::run_with`] function to automatically extract Fn arguments from the [`ServiceProvider`] and execute it.
+The `install_route` function in the example uses the [`ServiceFn`] trait as argument, which is a powerful type (of course we have [`ServiceFnMut`] and [`ServiceFnOnce`]), using the [`ServiceFn::run_with`] function to automatically extract Fn arguments from the [`ServiceProvider`] and execute it.
 
 # License
 
